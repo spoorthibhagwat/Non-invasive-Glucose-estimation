@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import pywt
 from datetime import timedelta
+import os
+
+
 
 class GlucosePreprocessor:
     def __init__(self, sampling_rate=64, window_seconds=30):
@@ -11,76 +14,112 @@ class GlucosePreprocessor:
     def denoise_signal(self, data):
         """Applies Discrete Wavelet Transform (DWT) denoising."""
         # Using Daubechies 4 wavelet as it mimics the PPG pulse shape
-        coeffs = pywt.wavedec(data, 'db4', level=4)
+        wav_coeffs = pywt.wavedec(data, 'db4', level=4)
         # Soft thresholding of high-frequency coefficients
-        threshold = 0.02 * np.max(np.abs(coeffs[-1]))
-        coeffs[1:] = [pywt.threshold(i, value=threshold, mode='soft') for i in coeffs[1:]]
-        clean_sig = pywt.waverec(coeffs, 'db4')
+        threshold = 0.02 * np.max(np.abs(wav_coeffs[-1]))
+        wav_coeffs[1:] = [pywt.threshold(i, value=threshold, mode='soft') for i in wav_coeffs[1:]]
+        clean_sig = pywt.waverec(wav_coeffs, 'db4')
         return clean_sig[:self.win_len]
 
-    def calculate_cob(self, food_df, current_time, decay_constant=0.015):
+    def cob_window(self, food_data, current_time, decay_constant=0.015):
         """Calculates Carbs-on-Board using exponential decay."""
-        if food_df is None or food_df.empty:
+        if food_data is None or food_data.empty:
             return 0.0
         
         # Ensure timestamps are datetime objects
-        food_df['timestamp'] = pd.to_datetime(food_df['timestamp'])
+        food_data['timestamp'] = pd.to_datetime(food_data['timestamp'])
         current_time = pd.to_datetime(current_time)
         
-        past_meals = food_df[food_df['timestamp'] <= current_time]
+        past_meals = food_data[food_data['timestamp'] <= current_time]
         cob = 0.0
         for _, meal in past_meals.iterrows():
             minutes_ago = (current_time - meal['timestamp']).total_seconds() / 60
             cob += meal['carbs'] * np.exp(-decay_constant * minutes_ago)
         return cob
+# --- 3. THE FULL PROCESSING FUNCTION ---
 
-    def create_sequences(self, bvp_df, cgm_df, food_df, hba1c, seq_steps=6):
-        """
-        Creates (PPG, Tabular) pairs.
-        seq_steps=6 creates a 30-minute lookback (6 steps * 5 mins).
-        """
-        X_ppg, X_tab, Y = [], [], []
+    def process_subject_for_dl(self,base_path, sid, hba1c):
+        print(f"Deep Processing Subject {sid}...")
+        sub_path = os.path.join(base_path, sid)
         
-        # Ensure sorted by time
-        cgm_df = cgm_df.sort_values('timestamp')
+        try:
+            cgm = pd.read_csv(os.path.join(sub_path, f"Dexcom_{sid}.csv"))
+            # In some versions of this dataset, files are in the root or have slightly different names
+            bvp = pd.read_csv(os.path.join(sub_path, f"BVP_{sid}.csv"))
+            food = pd.read_csv(os.path.join(sub_path, f"Food_Log_{sid}.csv"))
+        except FileNotFoundError:
+            print(f"  Files missing for {sid}, skipping...")
+            return None, None, None
+
+        # Clean CGM
+        cgm = cgm[cgm['Event Type'] == 'EGV'].copy()
+        cgm['dt'] = pd.to_datetime(cgm['Timestamp (YYYY-MM-DDThh:mm:ss)'], format='mixed')
+        cgm = cgm.dropna(subset=['Glucose Value (mg/dL)']).sort_values('dt')
         
-        for i in range(seq_steps, len(cgm_df)):
-            current_row = cgm_df.iloc[i]
-            t_now = pd.to_datetime(current_row['timestamp'])
+        # Clean BVP
+        bvp['dt'] = pd.to_datetime(bvp['datetime'], format='mixed')
+        bvp_sig = bvp.iloc[:, 1].values 
+        bvp_times = bvp['dt'].values.astype('datetime64[ns]')
+        
+        # Clean Food
+        food['dt_str'] = food['date'].astype(str) + ' ' + food['time'].astype(str)
+        food['datetime'] = pd.to_datetime(food['dt_str'], format='mixed')
+        food['total_carb'] = pd.to_numeric(food['total_carb'], errors='coerce').fillna(0)
+        S_BVP = 64 # BVP Frequency
+        SEQ_LEN = 6 # 30 minutes of history (6 * 5-min intervals)
+        BVP_WINDOW_SEC = 30 # Use 30s of PPG for morphology at each step
+        ppg_sequences, tab_sequences, targets = [], [], []
+
+        for i in range(SEQ_LEN, len(cgm)):
+            t_now = cgm.iloc[i]['dt']
             
-            seq_p, seq_t = [], []
+            # --- FIXED LINE BELOW: Changed m=2 to minutes=2 ---
+            t_fut = t_now + pd.Timedelta(minutes=30)
+            fut_val = cgm[(cgm['dt'] >= t_fut - pd.Timedelta(minutes=2)) & 
+                        (cgm['dt'] <= t_fut + pd.Timedelta(minutes=2))]
+            
+            if fut_val.empty: continue
+            target_val = fut_val.iloc[0]['Glucose Value (mg/dL)']
+
+            current_ppg_seq, current_tab_seq = [], []
             valid_seq = True
             
-            for step in range(seq_steps-1, -1, -1):
-                t_step = t_now - timedelta(minutes=step * 5)
+            for j in range(SEQ_LEN - 1, -1, -1): 
+                t_step = t_now - pd.Timedelta(minutes=j*5)
                 
-                # 1. Extract 30s PPG Window
-                mask = (bvp_df['timestamp'] > t_step - timedelta(seconds=30)) & \
-                       (bvp_df['timestamp'] <= t_step)
-                ppg_win = bvp_df.loc[mask, 'value'].values
+                # Find the closest CGM reading for this time step
+                step_data = cgm[(cgm['dt'] >= t_step - pd.Timedelta(minutes=2)) & 
+                                (cgm['dt'] <= t_step + pd.Timedelta(minutes=2))]
                 
-                if len(ppg_win) < self.win_len * 0.95: # Allow 5% missingness
-                    valid_seq = False; break
+                if step_data.empty:
+                    valid_seq = False
+                    break
+                    
+                glc_step = step_data.iloc[0]['Glucose Value (mg/dL)']
+                cob_step = self.cob_window(food, t_step)
+                hr_sin = np.sin(2 * np.pi * t_step.hour / 24)
                 
-                # Resample or pad to exact length
-                if len(ppg_win) != self.win_len:
-                    ppg_win = np.interp(np.linspace(0, 1, self.win_len), 
-                                        np.linspace(0, 1, len(ppg_win)), ppg_win)
+                current_tab_seq.append([glc_step, cob_step, hr_sin, hba1c])
+
+                # PPG Segment extraction
+                t_start_bvp = t_step - pd.Timedelta(seconds=BVP_WINDOW_SEC)
+                idx_start = np.searchsorted(bvp_times, t_start_bvp.to_datetime64())
+                idx_end = np.searchsorted(bvp_times, t_step.to_datetime64())
                 
-                seq_p.append(self.denoise_signal(ppg_win))
+                seg = bvp_sig[idx_start:idx_end]
+                if len(seg) < (FS_BVP * BVP_WINDOW_SEC * 0.8): # Tolerance for slight gaps
+                    valid_seq = False
+                    break
                 
-                # 2. Extract Tabular Features
-                cob = self.calculate_cob(food_df, t_step)
-                h_sin = np.sin(2 * np.pi * t_step.hour / 24)
-                # Note: We use the CGM value at t_step as an input feature (lag)
-                # and the CGM value at t_now as the target Y.
-                glc_lag = cgm_df.iloc[i - step]['glucose']
+                # Standardization/Padding
+                if len(seg) != 1920:
+                    seg = np.interp(np.linspace(0, 1, 1920), np.linspace(0, 1, len(seg)), seg)
                 
-                seq_t.append([glc_lag, cob, h_sin, hba1c])
-                
+                current_ppg_seq.append(self.denoise_signal(seg))
+
             if valid_seq:
-                X_ppg.append(seq_p)
-                X_tab.append(seq_t)
-                Y.append(current_row['glucose'])
-                
-        return np.array(X_ppg), np.array(X_tab), np.array(Y)
+                ppg_sequences.append(current_ppg_seq)
+                tab_sequences.append(current_tab_seq)
+                targets.append(target_val)
+
+        return np.array(ppg_sequences), np.array(tab_sequences), np.array(targets)
